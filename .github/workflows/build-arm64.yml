@@ -1,0 +1,315 @@
+name: Build ARM64 images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Harbor version tag (e.g. v2.14.2) — leave blank for latest stable'
+        required: false
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      harbor_version: ${{ steps.version.outputs.harbor_version }}
+    steps:
+      - name: Resolve Harbor version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION=$(curl -sf https://api.github.com/repos/goharbor/harbor/releases/latest | jq -r .tag_name)
+          fi
+          echo "Resolved version: $VERSION"
+          echo "harbor_version=$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build and push to Docker Hub
+    needs: resolve-version
+    runs-on: [self-hosted, arm64]
+    timeout-minutes: 120
+
+    if: ${{ !contains(github.ref, '-rc') && !contains(github.ref, '-beta') && !contains(github.ref, '-alpha') }}
+
+    env:
+      HARBOR_VERSION: ${{ needs.resolve-version.outputs.harbor_version }}
+      GOLANG_IMAGE: golang:1.26.0
+      TRIVY_VERSION: v0.68.2
+      TRIVY_ADAPTER_VERSION: v0.34.2
+      DISTRIBUTION_TAG: v2.8.3
+      HARBOR_SRC: ${{ github.workspace }}/harbor-src
+
+    steps:
+      - name: Checkout harbor-arm64 (patches and config)
+        uses: actions/checkout@v4
+
+      - name: Checkout Harbor source
+        uses: actions/checkout@v4
+        with:
+          repository: goharbor/harbor
+          ref: ${{ env.HARBOR_VERSION }}
+          path: harbor-src
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set derived variables
+        run: |
+          echo "BASE_NS=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+          echo "TAG=$HARBOR_VERSION" >> $GITHUB_ENV
+
+      # -------------------------------------------------------------------
+      # Step 1: Base images (photon + packages)
+      # -------------------------------------------------------------------
+      - name: Build base images
+        run: |
+          declare -A BASE_IMAGES=(
+            ["harbor-nginx-base"]="nginx"
+            ["harbor-redis-base"]="redis"
+            ["harbor-db-base"]="db"
+            ["harbor-core-base"]="core"
+            ["harbor-jobservice-base"]="jobservice"
+            ["harbor-portal-base"]="portal"
+            ["harbor-registry-base"]="registry"
+            ["harbor-registryctl-base"]="registryctl"
+            ["harbor-trivy-adapter-base"]="trivy-adapter"
+            ["harbor-exporter-base"]="exporter"
+          )
+          for image_name in "${!BASE_IMAGES[@]}"; do
+            dir="${BASE_IMAGES[$image_name]}"
+            target="$BASE_NS/$image_name:$TAG"
+            echo "Building $target"
+            docker build \
+              -f "$HARBOR_SRC/make/photon/$dir/Dockerfile.base" \
+              -t "$target" \
+              "$HARBOR_SRC"
+            docker push "$target"
+          done
+
+      # -------------------------------------------------------------------
+      # Step 2: Generate API server code via ARM64 go-swagger
+      # -------------------------------------------------------------------
+      - name: Generate API code
+        run: |
+          SWAGGER_IMAGE="harbor-swagger-arm64:v0.31.0"
+          docker build -t "$SWAGGER_IMAGE" - <<'EOF'
+          FROM golang:1.22
+          RUN go install github.com/go-swagger/go-swagger/cmd/swagger@v0.31.0
+          ENTRYPOINT ["/go/bin/swagger"]
+          EOF
+
+          docker run --rm \
+            -v "$HARBOR_SRC":/harbor \
+            -w /harbor \
+            "$SWAGGER_IMAGE" \
+            generate server \
+            --template-dir=/harbor/tools/swagger/templates \
+            --exclude-main \
+            --skip-validation \
+            --additional-initialism=CVE \
+            --additional-initialism=GC \
+            --additional-initialism=OIDC \
+            -f /harbor/api/v2.0/swagger.yaml \
+            --target /harbor/src/server/v2.0 \
+            --name harbor
+
+          cat > "$HARBOR_SRC/make/photon/prepare/versions" <<VERSIONS
+          VERSION_TAG: $HARBOR_VERSION
+          REGISTRY_VERSION: v2.8.3-patch-redis
+          TRIVY_VERSION: $TRIVY_VERSION
+          TRIVY_ADAPTER_VERSION: $TRIVY_ADAPTER_VERSION
+          VERSIONS
+
+      # -------------------------------------------------------------------
+      # Step 3: Compile Go binaries natively (ARM64)
+      # -------------------------------------------------------------------
+      - name: Compile Go binaries
+        run: |
+          docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/core "$GOLANG_IMAGE" \
+            /usr/local/go/bin/go build -buildvcs=false --ldflags "-w -s" \
+            -o /harbor/make/photon/core/harbor_core
+
+          docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/jobservice "$GOLANG_IMAGE" \
+            /usr/local/go/bin/go build -buildvcs=false \
+            -o /harbor/make/photon/jobservice/harbor_jobservice
+
+          docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/registryctl "$GOLANG_IMAGE" \
+            /usr/local/go/bin/go build -buildvcs=false \
+            -o /harbor/make/photon/registryctl/harbor_registryctl
+
+          docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/cmd/exporter "$GOLANG_IMAGE" \
+            /usr/local/go/bin/go build -buildvcs=false \
+            -o /harbor/make/photon/exporter/harbor_exporter
+
+      # -------------------------------------------------------------------
+      # Step 4: Build registry binary (distribution/distribution + redis patch)
+      # -------------------------------------------------------------------
+      - name: Build registry binary
+        run: |
+          DIST_TMP=$(mktemp -d)
+          git clone --depth 1 --branch "$DISTRIBUTION_TAG" \
+            https://github.com/distribution/distribution.git \
+            "$DIST_TMP"
+
+          cd "$DIST_TMP"
+          git apply "$GITHUB_WORKSPACE/patches/redis.patch"
+          cd -
+
+          cp "$HARBOR_SRC/make/photon/registry/Dockerfile.binary" "$DIST_TMP/"
+          docker build -f "$DIST_TMP/Dockerfile.binary" \
+            --build-arg golang_image="$GOLANG_IMAGE" \
+            -t harbor-registry-builder:arm64 "$DIST_TMP"
+
+          mkdir -p "$HARBOR_SRC/make/photon/registry/binary" \
+                   "$HARBOR_SRC/make/photon/registryctl/binary"
+
+          BUILDER_ID=$(docker create harbor-registry-builder:arm64)
+          docker cp "$BUILDER_ID":/go/src/github.com/docker/distribution/bin/registry \
+            "$HARBOR_SRC/make/photon/registry/binary/registry"
+          docker rm -f "$BUILDER_ID"
+          docker rmi -f harbor-registry-builder:arm64
+
+          cp "$HARBOR_SRC/make/photon/registry/binary/registry" \
+             "$HARBOR_SRC/make/photon/registryctl/binary/registry"
+          rm -rf "$DIST_TMP"
+
+      # -------------------------------------------------------------------
+      # Step 5: Download ARM64 Trivy binary
+      # -------------------------------------------------------------------
+      - name: Download Trivy binary
+        run: |
+          TRIVY_URL="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/trivy_${TRIVY_VERSION#v}_Linux-ARM64.tar.gz"
+          TRIVY_TMP=$(mktemp -d)
+          mkdir -p "$HARBOR_SRC/make/photon/trivy-adapter/binary"
+          curl -L --progress-bar "$TRIVY_URL" -o "$TRIVY_TMP/trivy.tar.gz"
+          tar -xzf "$TRIVY_TMP/trivy.tar.gz" -C "$TRIVY_TMP"
+          cp "$TRIVY_TMP/trivy" "$HARBOR_SRC/make/photon/trivy-adapter/binary/trivy"
+          chmod +x "$HARBOR_SRC/make/photon/trivy-adapter/binary/trivy"
+          rm -rf "$TRIVY_TMP"
+
+      # -------------------------------------------------------------------
+      # Step 6: Build scanner-trivy binary from source (with version ldflags)
+      # -------------------------------------------------------------------
+      - name: Build scanner-trivy binary
+        run: |
+          ADAPTER_TMP=$(mktemp -d)
+          curl -L "https://github.com/goharbor/harbor-scanner-trivy/archive/refs/tags/${TRIVY_ADAPTER_VERSION}.tar.gz" \
+            -o "$ADAPTER_TMP/scanner-trivy.tar.gz"
+          tar -xzf "$ADAPTER_TMP/scanner-trivy.tar.gz" -C "$ADAPTER_TMP" --strip-components=1
+
+          docker build -f - -t harbor-trivy-adapter-builder:arm64 "$ADAPTER_TMP" <<EOF
+          FROM golang:1.26.0
+          ADD . /go/src/github.com/goharbor/harbor-scanner-trivy/
+          WORKDIR /go/src/github.com/goharbor/harbor-scanner-trivy/
+          RUN export GOOS=linux GO111MODULE=on CGO_ENABLED=0 && \
+              go build -ldflags="-X main.version=${TRIVY_ADAPTER_VERSION}" \
+              -o scanner-trivy cmd/scanner-trivy/main.go
+          EOF
+
+          ADAPTER_ID=$(docker create harbor-trivy-adapter-builder:arm64)
+          docker cp "$ADAPTER_ID":/go/src/github.com/goharbor/harbor-scanner-trivy/scanner-trivy \
+            "$HARBOR_SRC/make/photon/trivy-adapter/binary/scanner-trivy"
+          docker rm -f "$ADAPTER_ID"
+          docker rmi -f harbor-trivy-adapter-builder:arm64
+          chmod +x "$HARBOR_SRC/make/photon/trivy-adapter/binary/scanner-trivy"
+          rm -rf "$ADAPTER_TMP"
+
+      # -------------------------------------------------------------------
+      # Step 7: Build portal (Node.js + nginx multi-stage)
+      # -------------------------------------------------------------------
+      - name: Build harbor-portal
+        run: |
+          docker build \
+            -f "$HARBOR_SRC/make/photon/portal/Dockerfile" \
+            --build-arg harbor_base_namespace="$BASE_NS" \
+            --build-arg harbor_base_image_version="$TAG" \
+            --build-arg NODE=node:16.18.0 \
+            -t "$BASE_NS/harbor-portal:$TAG" \
+            "$HARBOR_SRC"
+          docker push "$BASE_NS/harbor-portal:$TAG"
+
+      # -------------------------------------------------------------------
+      # Step 8: Build final component images
+      # -------------------------------------------------------------------
+      - name: Build final images
+        run: |
+          BUILD_ARGS="--build-arg harbor_base_namespace=$BASE_NS --build-arg harbor_base_image_version=$TAG"
+
+          build_and_push() {
+            local component="$1" image_name="$2"
+            local target="$BASE_NS/$image_name:$TAG"
+            echo "Building $target"
+            docker build -f "$HARBOR_SRC/make/photon/$component/Dockerfile" \
+              $BUILD_ARGS -t "$target" "$HARBOR_SRC"
+            docker push "$target"
+          }
+
+          build_and_push "nginx"          "nginx-photon"
+
+          # Redis: built from source with MALLOC=libc — no jemalloc, required for
+          # Raspberry Pi kernels with 16KB memory pages.
+          docker build -t "$BASE_NS/redis-photon:$TAG" -f - /tmp <<'REDIS_EOF'
+          FROM debian:bookworm-slim AS builder
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              build-essential wget ca-certificates && rm -rf /var/lib/apt/lists/*
+          ARG REDIS_VERSION=7.2.7
+          RUN wget -q http://download.redis.io/releases/redis-${REDIS_VERSION}.tar.gz \
+              && tar xzf redis-${REDIS_VERSION}.tar.gz \
+              && cd redis-${REDIS_VERSION} \
+              && make -j$(nproc) MALLOC=libc \
+              && make PREFIX=/redis-install install
+          FROM debian:bookworm-slim
+          RUN groupadd -r -g 999 redis && useradd -r -g redis -u 999 redis
+          COPY --from=builder /redis-install/bin/redis-server /redis-install/bin/redis-cli /usr/local/bin/
+          RUN mkdir -p /data && chown redis:redis /data
+          VOLUME /data
+          USER redis
+          EXPOSE 6379
+          CMD ["redis-server", "--protected-mode", "no", "--save", ""]
+          REDIS_EOF
+          docker push "$BASE_NS/redis-photon:$TAG"
+
+          build_and_push "db"             "harbor-db"
+          build_and_push "core"           "harbor-core"
+          build_and_push "jobservice"     "harbor-jobservice"
+          build_and_push "registry"       "registry-photon"
+          build_and_push "registryctl"    "harbor-registryctl"
+          build_and_push "trivy-adapter"  "trivy-adapter-photon"
+
+          # Exporter: upstream Dockerfile hardcodes amd64, use single-stage with pre-built binary
+          docker build \
+            --build-arg harbor_base_namespace="$BASE_NS" \
+            --build-arg harbor_base_image_version="$TAG" \
+            -t "$BASE_NS/harbor-exporter:$TAG" \
+            -f - "$HARBOR_SRC" <<'EXPORTER_EOF'
+          ARG harbor_base_namespace
+          ARG harbor_base_image_version
+          FROM ${harbor_base_namespace}/harbor-exporter-base:${harbor_base_image_version}
+          COPY ./make/photon/exporter/harbor_exporter /harbor/harbor_exporter
+          COPY ./make/photon/exporter/entrypoint.sh /harbor/
+          COPY ./make/photon/common/install_cert.sh /harbor/
+          RUN chown -R harbor:harbor /etc/pki/tls/certs \
+              && chown -R harbor:harbor /harbor/ \
+              && chmod u+x /harbor/entrypoint.sh \
+              && chmod u+x /harbor/install_cert.sh \
+              && chmod u+x /harbor/harbor_exporter
+          WORKDIR /harbor
+          USER harbor
+          ENTRYPOINT ["/harbor/entrypoint.sh"]
+          EXPORTER_EOF
+          docker push "$BASE_NS/harbor-exporter:$TAG"
+
+      # -------------------------------------------------------------------
+      # Cleanup builder images from the runner
+      # -------------------------------------------------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rmi -f harbor-swagger-arm64:v0.31.0 || true
+          docker image prune -f || true
