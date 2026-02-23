@@ -36,9 +36,8 @@ jobs:
 
     env:
       HARBOR_VERSION: ${{ needs.resolve-version.outputs.harbor_version }}
-      GOLANG_IMAGE: golang:1.26.0
-      TRIVY_VERSION: v0.68.2
-      TRIVY_ADAPTER_VERSION: v0.34.2
+      # GOLANG_IMAGE, TRIVY_VERSION, and TRIVY_ADAPTER_VERSION are read from the
+      # Harbor Makefile after checkout so they stay in sync with each release.
       DISTRIBUTION_TAG: v2.8.3
       HARBOR_SRC: ${{ github.workspace }}/harbor-src
 
@@ -52,6 +51,16 @@ jobs:
           repository: goharbor/harbor
           ref: ${{ env.HARBOR_VERSION }}
           path: harbor-src
+
+      - name: Read versions from Harbor Makefile
+        run: |
+          TRIVY_VERSION=$(grep "^TRIVYVERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
+          TRIVY_ADAPTER_VERSION=$(grep "^TRIVYADAPTERVERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
+          GOLANG_IMAGE=$(grep "^GOBUILDIMAGE=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
+          echo "TRIVY_VERSION=$TRIVY_VERSION" >> $GITHUB_ENV
+          echo "TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION" >> $GITHUB_ENV
+          echo "GOLANG_IMAGE=$GOLANG_IMAGE" >> $GITHUB_ENV
+          echo "Resolved: TRIVY_VERSION=$TRIVY_VERSION, TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION, GOLANG_IMAGE=$GOLANG_IMAGE"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -280,7 +289,14 @@ jobs:
           build_and_push "jobservice"     "harbor-jobservice"
           build_and_push "registry"       "registry-photon"
           build_and_push "registryctl"    "harbor-registryctl"
-          build_and_push "trivy-adapter"  "trivy-adapter-photon"
+
+          # trivy-adapter requires trivy_version so the image bakes in TRIVY_VERSION
+          docker build -f "$HARBOR_SRC/make/photon/trivy-adapter/Dockerfile" \
+            $BUILD_ARGS \
+            --build-arg trivy_version="$TRIVY_VERSION" \
+            -t "$BASE_NS/trivy-adapter-photon:$TAG" \
+            "$HARBOR_SRC"
+          docker push "$BASE_NS/trivy-adapter-photon:$TAG"
 
           # Exporter: upstream Dockerfile hardcodes amd64, use single-stage with pre-built binary
           docker build \
