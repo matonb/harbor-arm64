@@ -298,8 +298,15 @@ jobs:
             -o "$ADAPTER_TMP/scanner-trivy.tar.gz"
           tar -xzf "$ADAPTER_TMP/scanner-trivy.tar.gz" -C "$ADAPTER_TMP" --strip-components=1
 
+          # Derive the minimum Go version required by this scanner-trivy
+          # release from its go.mod, same approach as the go-swagger build
+          # above, so a future version bump can't silently break this build
+          # by requiring a newer Go than a hardcoded FROM line provides.
+          SCANNER_GO_VERSION=$(awk '/^go / {print $2}' "$ADAPTER_TMP/go.mod")
+          echo "harbor-scanner-trivy ${TRIVY_ADAPTER_VERSION} requires Go ${SCANNER_GO_VERSION}"
+
           docker build -f - -t harbor-trivy-adapter-builder:arm64 "$ADAPTER_TMP" <<EOF
-          FROM golang:1.26.0
+          FROM golang:${SCANNER_GO_VERSION}
           ADD . /go/src/github.com/goharbor/harbor-scanner-trivy/
           WORKDIR /go/src/github.com/goharbor/harbor-scanner-trivy/
           RUN export GOOS=linux GO111MODULE=on CGO_ENABLED=0 && \
