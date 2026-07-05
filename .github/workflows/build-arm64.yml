@@ -95,6 +95,37 @@ jobs:
           EOF
 
       # -------------------------------------------------------------------
+      # Step 0b: Alias ARM64 photon:5.0 as photon:5.0-legacy if upstream
+      # doesn't provide the latter. Harbor v2.15.2 switched most
+      # Dockerfile.base files to goharbor/photon:5.0-legacy, which is
+      # currently amd64-only. It isn't a byte-for-byte match for our
+      # photon:5.0 (upstream cut -legacy as a one-time snapshot on 2026-07-01
+      # to decouple the 2.15.x line from 5.0's ongoing rebuilds), but both
+      # come from the same Photon OS base and the drift is limited to OS
+      # package versions underneath Harbor's identically-compiled Go
+      # binaries — an acceptable approximation, consistent with how the 5.0
+      # fallback above already works. If -legacy ever gains a real arm64
+      # manifest this step becomes a no-op automatically.
+      # -------------------------------------------------------------------
+      - name: Check goharbor/photon:5.0-legacy ARM64 availability
+        id: photon_legacy_check
+        run: |
+          has_arm64=$(curl -sf "https://hub.docker.com/v2/repositories/goharbor/photon/tags/5.0-legacy" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if any(i.get('architecture')=='arm64' for i in d.get('images',[])) else 'false')")
+          echo "has_arm64=$has_arm64" >> $GITHUB_OUTPUT
+
+      - name: Alias ARM64 photon:5.0 as photon:5.0-legacy
+        if: steps.photon_legacy_check.outputs.has_arm64 == 'false'
+        run: |
+          # If photon:5.0 itself had no arm64 manifest, the earlier step
+          # already built and tagged it locally — pulling here would
+          # clobber that with the real (amd64-only) remote image instead.
+          if [ "${{ steps.photon_check.outputs.has_arm64 }}" = "true" ]; then
+            docker pull goharbor/photon:5.0
+          fi
+          docker tag goharbor/photon:5.0 goharbor/photon:5.0-legacy
+
+      # -------------------------------------------------------------------
       # Step 1: Base images (photon + packages)
       # -------------------------------------------------------------------
       - name: Build base images
