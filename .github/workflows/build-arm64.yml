@@ -57,11 +57,13 @@ jobs:
           TRIVY_ADAPTER_VERSION=$(grep "^TRIVYADAPTERVERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           GOLANG_IMAGE=$(grep "^GOBUILDIMAGE=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           SWAGGER_VERSION=$(grep "^SWAGGER_VERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
+          NODE_IMAGE=$(grep "^NODEBUILDIMAGE=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           echo "TRIVY_VERSION=$TRIVY_VERSION" >> $GITHUB_ENV
           echo "TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION" >> $GITHUB_ENV
           echo "GOLANG_IMAGE=$GOLANG_IMAGE" >> $GITHUB_ENV
           echo "SWAGGER_VERSION=$SWAGGER_VERSION" >> $GITHUB_ENV
-          echo "Resolved: TRIVY_VERSION=$TRIVY_VERSION, TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION, GOLANG_IMAGE=$GOLANG_IMAGE, SWAGGER_VERSION=$SWAGGER_VERSION"
+          echo "NODE_IMAGE=$NODE_IMAGE" >> $GITHUB_ENV
+          echo "Resolved: TRIVY_VERSION=$TRIVY_VERSION, TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION, GOLANG_IMAGE=$GOLANG_IMAGE, SWAGGER_VERSION=$SWAGGER_VERSION, NODE_IMAGE=$NODE_IMAGE"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v4.0.0
@@ -341,7 +343,7 @@ jobs:
             -f "$HARBOR_SRC/make/photon/portal/Dockerfile" \
             --build-arg harbor_base_namespace="$BASE_NS" \
             --build-arg harbor_base_image_version="$TAG" \
-            --build-arg NODE=node:16.18.0 \
+            --build-arg NODE="$NODE_IMAGE" \
             $OCI_LABELS \
             -t "$BASE_NS/harbor-portal:$TAG" \
             "$HARBOR_SRC"
