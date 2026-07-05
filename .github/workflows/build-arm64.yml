@@ -140,9 +140,15 @@ jobs:
             done
           }
 
+          # Harbor v2.15.2 replaced make/photon/redis with make/photon/valkey
+          # (Redis -> Valkey migration). Older tags built on demand via this
+          # workflow's `tag` input still only have `redis`, so list both and
+          # skip whichever one this Harbor version doesn't have instead of
+          # hardcoding a single name.
           declare -A BASE_IMAGES=(
             ["harbor-nginx-base"]="nginx"
             ["harbor-redis-base"]="redis"
+            ["harbor-valkey-base"]="valkey"
             ["harbor-db-base"]="db"
             ["harbor-core-base"]="core"
             ["harbor-jobservice-base"]="jobservice"
@@ -154,6 +160,10 @@ jobs:
           )
           for image_name in "${!BASE_IMAGES[@]}"; do
             dir="${BASE_IMAGES[$image_name]}"
+            if [ ! -d "$HARBOR_SRC/make/photon/$dir" ]; then
+              echo "Skipping $image_name: $HARBOR_SRC/make/photon/$dir not present in $HARBOR_VERSION"
+              continue
+            fi
             target="$BASE_NS/$image_name:$TAG"
             echo "Building $target"
             docker build \
