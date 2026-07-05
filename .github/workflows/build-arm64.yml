@@ -73,6 +73,10 @@ jobs:
         run: |
           echo "BASE_NS=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
           echo "TAG=$HARBOR_VERSION" >> $GITHUB_ENV
+          # Applied to every image actually pushed to Docker Hub, so viewers
+          # can trace provenance back to the build definition and exact
+          # commit that produced it (docker inspect / GitHub package links).
+          echo "OCI_LABELS=--label org.opencontainers.image.source=https://github.com/matonb/harbor-arm64 --label org.opencontainers.image.revision=${{ github.sha }} --label org.opencontainers.image.version=$HARBOR_VERSION" >> $GITHUB_ENV
 
       # -------------------------------------------------------------------
       # Step 0: Build ARM64 photon base if upstream doesn't provide one
@@ -168,6 +172,7 @@ jobs:
             echo "Building $target"
             docker build \
               -f "$HARBOR_SRC/make/photon/$dir/Dockerfile.base" \
+              $OCI_LABELS \
               -t "$target" \
               "$HARBOR_SRC"
             push_with_retry "$target"
@@ -330,6 +335,7 @@ jobs:
             --build-arg harbor_base_namespace="$BASE_NS" \
             --build-arg harbor_base_image_version="$TAG" \
             --build-arg NODE=node:16.18.0 \
+            $OCI_LABELS \
             -t "$BASE_NS/harbor-portal:$TAG" \
             "$HARBOR_SRC"
           push_with_retry "$BASE_NS/harbor-portal:$TAG"
@@ -356,7 +362,7 @@ jobs:
             local target="$BASE_NS/$image_name:$TAG"
             echo "Building $target"
             docker build -f "$HARBOR_SRC/make/photon/$component/Dockerfile" \
-              $BUILD_ARGS -t "$target" "$HARBOR_SRC"
+              $BUILD_ARGS $OCI_LABELS -t "$target" "$HARBOR_SRC"
             push_with_retry "$target"
           }
 
@@ -364,7 +370,7 @@ jobs:
 
           # Redis: built from source with MALLOC=libc — no jemalloc, required for
           # Raspberry Pi kernels with 16KB memory pages.
-          docker build -t "$BASE_NS/redis-photon:$TAG" -f - /tmp <<'REDIS_EOF'
+          docker build $OCI_LABELS -t "$BASE_NS/redis-photon:$TAG" -f - /tmp <<'REDIS_EOF'
           FROM debian:bookworm-slim AS builder
           RUN apt-get update && apt-get install -y --no-install-recommends \
               build-essential wget ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -395,6 +401,7 @@ jobs:
           docker build -f "$HARBOR_SRC/make/photon/trivy-adapter/Dockerfile" \
             $BUILD_ARGS \
             --build-arg trivy_version="$TRIVY_VERSION" \
+            $OCI_LABELS \
             -t "$BASE_NS/trivy-adapter-photon:$TAG" \
             "$HARBOR_SRC"
           push_with_retry "$BASE_NS/trivy-adapter-photon:$TAG"
@@ -403,6 +410,7 @@ jobs:
           docker build \
             --build-arg harbor_base_namespace="$BASE_NS" \
             --build-arg harbor_base_image_version="$TAG" \
+            $OCI_LABELS \
             -t "$BASE_NS/harbor-exporter:$TAG" \
             -f - "$HARBOR_SRC" <<'EXPORTER_EOF'
           ARG harbor_base_namespace
