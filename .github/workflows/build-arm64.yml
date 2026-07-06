@@ -494,11 +494,15 @@ jobs:
             payload=$(python3 -c "import json,sys; print(json.dumps({'full_description': sys.stdin.read()}))" <<< "$full_description")
 
             echo "Updating Docker Hub description for $BASE_NS/$image_name"
-            curl -sf -X PATCH "https://hub.docker.com/v2/repositories/$BASE_NS/$image_name" \
+            http_code=$(curl -s -o /tmp/dockerhub_response.json -w "%{http_code}" -X PATCH \
+              "https://hub.docker.com/v2/repositories/$BASE_NS/$image_name/" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $DOCKERHUB_JWT" \
-              -d "$payload" > /dev/null \
-              || echo "Failed to update description for $image_name (continuing)"
+              -d "$payload")
+            if [ "$http_code" -ge 400 ]; then
+              echo "Failed to update description for $image_name (HTTP $http_code, continuing):"
+              cat /tmp/dockerhub_response.json
+            fi
           done
 
       # -------------------------------------------------------------------
