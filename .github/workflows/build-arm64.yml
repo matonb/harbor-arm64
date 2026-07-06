@@ -79,6 +79,10 @@ jobs:
           # can trace provenance back to the build definition and exact
           # commit that produced it (docker inspect / GitHub package links).
           echo "OCI_LABELS=--label org.opencontainers.image.source=https://github.com/matonb/harbor-arm64 --label org.opencontainers.image.revision=${{ github.sha }} --label org.opencontainers.image.version=$HARBOR_VERSION" >> $GITHUB_ENV
+          # Tracks every image pushed this run, for the Docker Hub description
+          # sync step at the end. This is a self-hosted runner whose workspace
+          # persists between jobs, so start from a clean file each run.
+          rm -f "$GITHUB_WORKSPACE/.pushed_images"
 
       # -------------------------------------------------------------------
       # Step 0: Build ARM64 photon base if upstream doesn't provide one
@@ -144,6 +148,7 @@ jobs:
               echo "Push failed, retrying ($attempt/3) in 30s..."
               sleep 30
             done
+            echo "$target" >> "$GITHUB_WORKSPACE/.pushed_images"
           }
 
           # Harbor v2.15.2 replaced make/photon/redis with make/photon/valkey
@@ -337,6 +342,7 @@ jobs:
               echo "Push failed, retrying ($attempt/3) in 30s..."
               sleep 30
             done
+            echo "$target" >> "$GITHUB_WORKSPACE/.pushed_images"
           }
 
           docker build \
@@ -364,6 +370,7 @@ jobs:
               echo "Push failed, retrying ($attempt/3) in 30s..."
               sleep 30
             done
+            echo "$target" >> "$GITHUB_WORKSPACE/.pushed_images"
           }
 
           build_and_push() {
@@ -438,6 +445,61 @@ jobs:
           ENTRYPOINT ["/harbor/entrypoint.sh"]
           EXPORTER_EOF
           push_with_retry "$BASE_NS/harbor-exporter:$TAG"
+
+      # -------------------------------------------------------------------
+      # Sync Docker Hub descriptions for every image pushed this run, so
+      # each image's page links back to this repo, its CI logs, and its own
+      # tags list (Docker Hub doesn't infer any of this on its own), and
+      # states which Harbor version and build actually produced it.
+      # -------------------------------------------------------------------
+      - name: Sync Docker Hub descriptions
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          # Routed through python's json/urllib rather than hand-built JSON
+          # in a shell string, so credentials can't break the request if
+          # they ever contain a quote or backslash.
+          DOCKERHUB_JWT=$(python3 -c "
+          import json, os, urllib.request
+          body = json.dumps({'identifier': os.environ['DOCKERHUB_USERNAME'], 'secret': os.environ['DOCKERHUB_TOKEN']}).encode()
+          req = urllib.request.Request('https://hub.docker.com/v2/auth/token', data=body, headers={'Content-Type': 'application/json'})
+          print(json.load(urllib.request.urlopen(req))['access_token'])
+          ")
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+
+          sort -u "$GITHUB_WORKSPACE/.pushed_images" | while read -r target; do
+            image_name="${target#*/}"
+            image_name="${image_name%%:*}"
+
+            full_description=$(cat <<DESC
+          ## GitHub Repo
+          https://github.com/matonb/harbor-arm64
+
+          ## CI build logs
+          https://github.com/matonb/harbor-arm64/actions
+
+          ## Docker image tags
+          https://hub.docker.com/r/$BASE_NS/$image_name/tags
+
+          ---
+
+          ARM64 build of Harbor's \`$image_name\`, built from [goharbor/harbor](https://github.com/goharbor/harbor) \`$HARBOR_VERSION\`.
+
+          Last built by [run #$GITHUB_RUN_NUMBER](https://github.com/matonb/harbor-arm64/actions/runs/$GITHUB_RUN_ID) from commit [\`$SHORT_SHA\`](https://github.com/matonb/harbor-arm64/commit/$GITHUB_SHA).
+          DESC
+          )
+
+            payload=$(python3 -c "import json,sys; print(json.dumps({'full_description': sys.stdin.read()}))" <<< "$full_description")
+
+            echo "Updating Docker Hub description for $BASE_NS/$image_name"
+            curl -sf -X PATCH "https://hub.docker.com/v2/repositories/$BASE_NS/$image_name" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $DOCKERHUB_JWT" \
+              -d "$payload" > /dev/null \
+              || echo "Failed to update description for $image_name (continuing)"
+          done
 
       # -------------------------------------------------------------------
       # Cleanup builder images from the runner
