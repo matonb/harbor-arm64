@@ -468,6 +468,8 @@ jobs:
           ")
 
           SHORT_SHA="${GITHUB_SHA:0:7}"
+          RESPONSE_FILE=$(mktemp)
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
 
           sort -u "$GITHUB_WORKSPACE/.pushed_images" | while read -r target; do
             image_name="${target#*/}"
@@ -494,14 +496,14 @@ jobs:
             payload=$(python3 -c "import json,sys; print(json.dumps({'full_description': sys.stdin.read()}))" <<< "$full_description")
 
             echo "Updating Docker Hub description for $BASE_NS/$image_name"
-            http_code=$(curl -s -o /tmp/dockerhub_response.json -w "%{http_code}" -X PATCH \
+            http_code=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X PATCH \
               "https://hub.docker.com/v2/repositories/$BASE_NS/$image_name/" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $DOCKERHUB_JWT" \
               -d "$payload")
             if [ "$http_code" -ge 400 ]; then
               echo "Failed to update description for $image_name (HTTP $http_code, continuing):"
-              cat /tmp/dockerhub_response.json
+              cat "$RESPONSE_FILE"
             fi
           done
 
