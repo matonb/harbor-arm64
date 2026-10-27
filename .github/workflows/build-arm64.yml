@@ -23,6 +23,12 @@ jobs:
           else
             VERSION=$(curl -sf https://api.github.com/repos/goharbor/harbor/releases/latest | jq -r .tag_name)
           fi
+          # Harbor tags all carry a leading "v"; accept "2.14.6" as "v2.14.6"
+          # so a missing prefix doesn't fail the source checkout later.
+          case "$VERSION" in
+            v*) ;;
+            *) VERSION="v$VERSION" ;;
+          esac
           echo "Resolved version: $VERSION"
           echo "harbor_version=$VERSION" >> $GITHUB_OUTPUT
 
