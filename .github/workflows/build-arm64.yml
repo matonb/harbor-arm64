@@ -105,27 +105,20 @@ jobs:
           EOF
 
       # -------------------------------------------------------------------
-      # Step 0b: Alias ARM64 photon:5.0 as photon:5.0-legacy if upstream
-      # doesn't provide the latter. Harbor v2.15.2 switched most
-      # Dockerfile.base files to goharbor/photon:5.0-legacy, which is
-      # currently amd64-only. It isn't a byte-for-byte match for our
-      # photon:5.0 (upstream cut -legacy as a one-time snapshot on 2026-07-01
-      # to decouple the 2.15.x line from 5.0's ongoing rebuilds), but both
-      # come from the same Photon OS base and the drift is limited to OS
-      # package versions underneath Harbor's identically-compiled Go
-      # binaries — an acceptable approximation, consistent with how the 5.0
-      # fallback above already works. If -legacy ever gains a real arm64
-      # manifest this step becomes a no-op automatically.
+      # Step 0b: Alias ARM64 photon:5.0 as every other goharbor/photon tag
+      # that this Harbor version's Dockerfile.base files reference but
+      # upstream only publishes for amd64. Harbor uses a different tag per
+      # release line (5.0-v2.14 for 2.14.x, 5.0-legacy for 2.15.x), so the
+      # tags are discovered from the checked-out source rather than
+      # hardcoded. They are snapshots of 5.0 taken at different times, so
+      # they aren't byte-for-byte matches for our photon:5.0, but all come
+      # from the same Photon OS base and the drift is limited to OS package
+      # versions underneath Harbor's identically-compiled Go binaries — an
+      # acceptable approximation, consistent with how the 5.0 fallback above
+      # already works. A tag that gains a real arm64 manifest is skipped
+      # automatically.
       # -------------------------------------------------------------------
-      - name: Check goharbor/photon:5.0-legacy ARM64 availability
-        id: photon_legacy_check
-        run: |
-          has_arm64=$(curl -sf "https://hub.docker.com/v2/repositories/goharbor/photon/tags/5.0-legacy" \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if any(i.get('architecture')=='arm64' for i in d.get('images',[])) else 'false')")
-          echo "has_arm64=$has_arm64" >> $GITHUB_OUTPUT
-
-      - name: Alias ARM64 photon:5.0 as photon:5.0-legacy
-        if: steps.photon_legacy_check.outputs.has_arm64 == 'false'
+      - name: Alias ARM64 photon:5.0 for amd64-only photon tags
         run: |
           # If photon:5.0 itself had no arm64 manifest, the earlier step
           # already built and tagged it locally — pulling here would
@@ -133,7 +126,21 @@ jobs:
           if [ "${{ steps.photon_check.outputs.has_arm64 }}" = "true" ]; then
             docker pull goharbor/photon:5.0
           fi
-          docker tag goharbor/photon:5.0 goharbor/photon:5.0-legacy
+
+          mapfile -t refs < <(grep -rhoE 'goharbor/photon:[A-Za-z0-9._-]+' \
+            "$HARBOR_SRC"/make/photon/*/Dockerfile.base | sort -u)
+          for ref in "${refs[@]}"; do
+            tag="${ref#goharbor/photon:}"
+            [ "$tag" = "5.0" ] && continue
+            has_arm64=$(curl -sf "https://hub.docker.com/v2/repositories/goharbor/photon/tags/$tag" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if any(i.get('architecture')=='arm64' for i in d.get('images',[])) else 'false')")
+            if [ "$has_arm64" = "true" ]; then
+              echo "$ref has an upstream arm64 manifest, leaving as-is"
+            else
+              echo "Aliasing ARM64 goharbor/photon:5.0 as $ref"
+              docker tag goharbor/photon:5.0 "$ref"
+            fi
+          done
 
       # -------------------------------------------------------------------
       # Step 1: Base images (photon + packages)
