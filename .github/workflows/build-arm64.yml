@@ -149,6 +149,23 @@ jobs:
           done
 
       # -------------------------------------------------------------------
+      # Step 0c: Harbor's redis Dockerfile.base pins the full Photon package
+      # release (e.g. redis-7.2.11-1.1.1.ph5), but the trailing rebuild
+      # number differs between architectures: aarch64 only ships
+      # redis-7.2.11-1.1.ph5, so the exact pin isn't found. Drop the release
+      # suffix and keep the version pin so tdnf picks the arch's build of
+      # the same upstream redis (and the unversioned "redis" still isn't
+      # used, since that now resolves to Valkey).
+      # -------------------------------------------------------------------
+      - name: Relax pinned redis package release for ARM64
+        run: |
+          redis_df="$HARBOR_SRC/make/photon/redis/Dockerfile.base"
+          if [ -f "$redis_df" ]; then
+            sed -i -E 's/(redis-[0-9]+\.[0-9]+\.[0-9]+)-[0-9.]+\.ph[0-9]+/\1/' "$redis_df"
+            grep -n 'tdnf install.*redis' "$redis_df"
+          fi
+
+      # -------------------------------------------------------------------
       # Step 1: Base images (photon + packages)
       # -------------------------------------------------------------------
       - name: Build base images
