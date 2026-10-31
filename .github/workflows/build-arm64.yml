@@ -49,10 +49,10 @@ jobs:
 
     steps:
       - name: Checkout harbor-arm64 (patches and config)
-        uses: actions/checkout@v4.3.0
+        uses: actions/checkout@v7.0.1
 
       - name: Checkout Harbor source
-        uses: actions/checkout@v4.3.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: goharbor/harbor
           ref: ${{ env.HARBOR_VERSION }}
